@@ -9,6 +9,21 @@ See DataExtraction.ipynb for example extraction and format of the data. probably
 
 Unfortunately, failed to reproduce the segmentation method mentioned in papers. Right now, assume the mid-1s window in 3s are the stead state of rest and the corresponding gesture.
 
+# For TCN only
+
+'''
+conda create -n emg_tcn python=3.11 \
+    cudatoolkit=11.8 cudnn=8.9 -c conda-forge
+conda activate emg_tcn
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+'''
+## Preprocessing
+Use dataset_preprocessing.py first, then use dataset_forming.py
+
+## Network training
+Run train.py
+
 
 
 
