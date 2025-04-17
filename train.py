@@ -34,7 +34,7 @@ def main():
     args = parser.parse_args()
 
     # Initialize Weights & Biases
-    wandb.login(key='dbefa42bdc21e918944847403b184f3084b373e6')
+    wandb.login(key='')
     wandb.init(project=args.wandb_project, config=vars(args))
     device = torch.device(int(args.device))
 
