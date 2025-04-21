@@ -16,12 +16,8 @@ It cleans and normalizes the raw signals by fixing bad channels, applying band-p
 
     It also creates overlapping 200 ms windows (with 50 ms hops) from those one‑second segments and saves them in segmented_200ms.pkl. 
     
-All output files live in the data_for_training/ directory.
+4) run Example_data_extraction.py to see the result. All output files live in the data_for_training/ directory. 
 
-Todo:
-1) revise the segmentation (done)
-2) interpolate the bad electrodes (done)
-3) wavelet transform and dictionary learning (done)
 
 
 
