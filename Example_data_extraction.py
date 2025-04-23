@@ -6,7 +6,7 @@ import pandas as pd
 
 # Paths to the PKL files
 processed_path = os.path.join('data_for_training', 'processed_data.pkl')
-labels_path = os.path.join('data_for_training', 'labels_data.pkl')
+labels_path    = os.path.join('data_for_training', 'labels_data.pkl')
 
 # Load the data
 with open(processed_path, 'rb') as f:
@@ -33,12 +33,13 @@ print(df.to_string(index=False))
 # Select first subject and gesture to plot channel 0
 sel_subject = df.loc[2, 'Subject']
 sel_gesture = df.loc[2, 'Gesture']
-channel_idx = 10
+channel_idx = 43
 
 proc_signal = processed_data[sel_subject][sel_gesture][channel_idx]
 label_mask  = labels_data[sel_subject][sel_gesture][channel_idx]
 
 # Plot
+
 t = np.arange(proc_signal.size)
 plt.figure(figsize=(12, 4))
 plt.plot(t, proc_signal, label='Processed Signal (ch 0)')
@@ -58,11 +59,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ───────── CONFIG ─────────
-DATA_DIR = 'data_for_training'
+DATA_DIR       = 'data_for_training'
 OUTPUT_IMG_DIR = 'image_examples'
-NUM_SAMPLES = 5
-FS = 2048
-WIN1 = FS  # 1 second
+NUM_SAMPLES    = 5
+FS             = 2048
+WIN1           = FS  # 1 second
 
 # ───────── HELPERS ─────────
 def vector_to_image(vec):
@@ -82,7 +83,14 @@ with open(os.path.join(DATA_DIR, 'dwt.pkl'), 'rb') as f:
     dwt_ds = pickle.load(f)
 with open(os.path.join(DATA_DIR, 'dict.pkl'), 'rb') as f:
     dict_ds = pickle.load(f)
+# ─── NEW: load LLC reconstructions
+with open(os.path.join(DATA_DIR, 'llc.pkl'), 'rb') as f:
+    llc_ds = pickle.load(f)
 
+print("Subjects in dwt_ds:", sorted(dwt_ds.keys()))
+print("Subjects in dict_ds:", sorted(dict_ds.keys()))
+print("Subjects in llc_ds:", sorted(llc_ds.keys()))
+print("Subjects in actual_ds:", sorted(actual_ds.keys()))
 # Select a subject and gesture for demonstration
 subj0 = sorted(actual_ds.keys())[0]
 gest0 = sorted(actual_ds[subj0].keys())[0]
@@ -105,13 +113,15 @@ for i in range(3):
 # Bottom row: 6s channel-0 comparison across all columns
 ax_ts = fig.add_subplot(gs[1, :])
 t = np.arange(6*FS) / FS
-ch_act  = actual_ds[subj0][gest0][0, :6*FS]
-ch_dwt  = dwt_ds[subj0][gest0][0, :6*FS]
-ch_dict = dict_ds[subj0][gest0][0, :6*FS]
+ch_act   = actual_ds[subj0][gest0][0, :6*FS]
+ch_dwt   = dwt_ds[subj0][gest0][0, :6*FS]
+ch_dict  = dict_ds[subj0][gest0][0, :6*FS]
+ch_llc   = llc_ds[subj0][gest0][0, :6*FS]  # LLC
 
-ax_ts.plot(t, ch_act, label='Actual', linewidth=1)
-ax_ts.plot(t, ch_dwt, linestyle='--', label='DWT recon', linewidth=1)
-ax_ts.plot(t, ch_dict, linestyle=':', label='Dict recon', linewidth=1)
+ax_ts.plot(t, ch_act,   label='Actual',      linewidth=1)
+ax_ts.plot(t, ch_dwt,   linestyle='--', label='DWT recon',  linewidth=1)
+ax_ts.plot(t, ch_dict,  linestyle=':',  label='Dict recon', linewidth=1)
+ax_ts.plot(t, ch_llc,   linestyle='-.', label='LLC recon',  linewidth=1)
 ax_ts.set_title(f"{subj0}/{gest0} Channel 0: First 6 Seconds", fontsize=11)
 ax_ts.set_xlabel("Time (s)", fontsize=9)
 ax_ts.set_ylabel("Amplitude", fontsize=9)
@@ -125,7 +135,6 @@ plt.show()
 os.makedirs(OUTPUT_IMG_DIR, exist_ok=True)
 
 # Select subject and gestures
-subj0 = sorted(actual_ds.keys())[0]
 gestures = sorted(actual_ds[subj0].keys())
 
 # Determine minimum common length
@@ -139,7 +148,7 @@ sample_idxs = rng.choice(min_len, size=NUM_SAMPLES, replace=False)
 all_vals = []
 for t_idx in sample_idxs:
     for gest in gestures:
-        for ds in (actual_ds, dwt_ds, dict_ds):
+        for ds in (actual_ds, dwt_ds, dict_ds, llc_ds):  # include LLC
             all_vals.append(ds[subj0][gest][:, t_idx])
 all_vals = np.hstack(all_vals)
 
@@ -148,17 +157,18 @@ vmax = np.percentile(all_vals, 99)
 
 # ───────── PLOT & SAVE WITH CONSISTENT PERCENTILE SCALE ─────────
 for t_idx in sample_idxs:
-    fig, axes = plt.subplots(len(gestures), 3, 
-                             figsize=(10, 3*len(gestures)), 
+    fig, axes = plt.subplots(len(gestures), 4, 
+                             figsize=(12, 3*len(gestures)), 
                              constrained_layout=True)
     
     for row, gest in enumerate(gestures):
         imgs = [
             vector_to_image(actual_ds[subj0][gest][:, t_idx]),
             vector_to_image(dwt_ds[subj0][gest][:, t_idx]),
-            vector_to_image(dict_ds[subj0][gest][:, t_idx])
+            vector_to_image(dict_ds[subj0][gest][:, t_idx]),
+            vector_to_image(llc_ds[subj0][gest][:, t_idx])  # LLC
         ]
-        titles = ['Actual', 'DWT Recon', 'Dict Recon']
+        titles = ['Actual', 'DWT Recon', 'Dict Recon', 'LLC Recon']
         for col, (img, title) in enumerate(zip(imgs, titles)):
             ax = axes[row, col]
             im = ax.imshow(img, origin='lower', aspect='equal',
@@ -174,9 +184,9 @@ for t_idx in sample_idxs:
                                 fraction=0.046, pad=0.02)
             cbar.ax.tick_params(labelsize=6)
     
-    fig.suptitle(f"{subj0}: Frame {t_idx} ", fontsize=14)
+    fig.suptitle(f"{subj0}: Frame {t_idx}", fontsize=14)
     save_path = os.path.join(OUTPUT_IMG_DIR, f"{subj0}_frame_{t_idx}.png")
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
-print(f"Saved {NUM_SAMPLES} composite images with 5th–95th percentile scale to '{OUTPUT_IMG_DIR}/'.")
+print(f"Saved {NUM_SAMPLES} composite images (including LLC) to '{OUTPUT_IMG_DIR}/*.png'.")

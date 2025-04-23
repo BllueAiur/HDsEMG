@@ -1,212 +1,391 @@
 #!/usr/bin/env python3
+"""
+HD-sEMG Reconstruction & Separability Benchmark
+
+This script compares the following methods for 8×8 block reconstruction and
+class separability on HD-sEMG data:
+  - DCT-based sparsification
+  - Wavelet-based sparsification (bior1.3, db1, coif1)
+  - MiniBatchDictionaryLearning + OMP sparse coding
+  - Locality-constrained Linear Coding (LLC)
+
+The single sparsity parameter `k` (from CONFIG['SPARSE_KS']) controls:
+  • number of retained coefficients in DCT and wavelet transforms
+  • number of nonzero atoms in OMP codes
+  • number of nearest atoms (knn) and nonzeros in LLC
+
+Outputs:
+  • Reconstruction quality (NMSE, PSNR) vs k plots
+  • Global Fisher separability vs k plots
+  • Full grid of reconstructed blocks
+"""
 import os
 import pickle
-import numpy as np
+import warnings
+from collections import defaultdict
+
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
+import numpy as np
 import pywt
 from scipy.fftpack import dct, idct
 from sklearn.decomposition import MiniBatchDictionaryLearning
 from sklearn.linear_model import OrthogonalMatchingPursuit
+from sklearn.preprocessing import StandardScaler
+
 from utils.hongj_preprocess import bandpass_filter, notch_filter, load_semg_data
-import warnings
-from collections import defaultdict
+from utils.LLC import MultiClassLLC
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# ------------------------- Configuration -------------------------
+
+# ───────────────────────── Configuration ──────────────────────────
 CONFIG = {
-    'DATA_PATH':           'Data_KN',
-    'PICKLE_PATH':         'processed_data.pkl',
-    'FS':                  2048,
-    'BP_CUTOFF':           (20, 450),
-    'NOTCH_FREQ':          50,
-    'NOTCH_Q':             50,
-    'TRAIN_FRAC':          0.01,
-    'TEST_SAMPLES':        2000,
-    'RNG_SEED':            42,
-    'SPARSE_KS':           [8, 12, 16, 20,24, 28,32],
-    'WAVELET_FAMILIES':    ['db1', 'coif1', 'bior1.3'],
-    'DICT_ATOMS_LIST':     [128, 256],
-    'BATCH_SIZE':          512,
-    'DICT_INITS':          ['random'],
-    'PLOT_SIZE':           (14, 6)
+    "DATA_PATH": "Data_KN",
+    "PICKLE_PATH": "processed_data.pkl",
+    "FS": 2048,
+    "BP_CUTOFF": (20, 450),
+    "NOTCH_FREQ": 50,
+    "NOTCH_Q": 50,
+    "TRAIN_FRAC": 0.02,
+    "TEST_SAMPLES": 2500,
+    "RNG_SEED": 191,
+    "SPARSE_KS": [8,10,12,14,16,18,20,22,24],
+    "WAVELET_FAMILIES": ["bior1.3", "db1", "coif1"],
+    "DICT_ATOMS_LIST": [128],
+    "BATCH_SIZE": 1024,
+    "PLOT_SIZE": (14, 6),
+    # LLC hyperparameters
+    "LLC_BETA": 1e-3,
+    "LLC_WORDS_PER_CLASS": 16
 }
 
-# ------------------------- Output Directory -------------------------
 OUTPUT_DIR = "image_reconstruction"
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ------------------------- Utility Functions -------------------------
-def vector_to_image(vec):
+
+# ───────────────────────── Helper Functions ───────────────────────
+
+def vector_to_image(vec: np.ndarray) -> np.ndarray:
+    """Convert a 64-element vector to an 8×8 image."""
     img = np.zeros((8, 8))
-    for idx in range(64):
-        row = 7 - (idx % 8)
-        col = 7 - (idx // 8)
-        img[row, col] = vec[idx]
+    for i in range(64):
+        row = 7 - (i % 8)
+        col = 7 - (i // 8)
+        img[row, col] = vec[i]
     return img
 
-def dct2d(img):
-    return dct(dct(img.T, norm='ortho').T, norm='ortho')
 
-def idct2d(coeffs):
-    return idct(idct(coeffs.T, norm='ortho').T, norm='ortho')
+def dct2d(img: np.ndarray) -> np.ndarray:
+    """2D DCT with orthonormal normalization."""
+    return dct(dct(img.T, norm="ortho").T, norm="ortho")
 
-def compute_nmse(original, reconstructed):
-    return np.sum((original - reconstructed)**2) / np.sum(original**2)
 
-def compute_psnr(original, reconstructed):
-    mse = np.mean((original - reconstructed)**2)
+def idct2d(coefs: np.ndarray) -> np.ndarray:
+    """2D inverse DCT with orthonormal normalization."""
+    return idct(idct(coefs.T, norm="ortho").T, norm="ortho")
+
+
+def compute_nmse(orig: np.ndarray, rec: np.ndarray) -> float:
+    """Normalized mean squared error."""
+    return np.sum((orig - rec) ** 2) / np.sum(orig ** 2)
+
+
+def compute_psnr(orig: np.ndarray, rec: np.ndarray) -> float:
+    """Peak signal-to-noise ratio in dB."""
+    mse = np.mean((orig - rec) ** 2)
     if mse == 0:
-        return float('inf')
-    max_val = np.max(original)
-    return 10 * np.log10((max_val**2) / mse)
+        return float("inf")
+    return 10 * np.log10(np.max(orig) ** 2 / mse)
 
-# ------------------------- Data Loading & Preprocessing -------------------------
-def load_and_preprocess_data():
-    print("1/4 ▶ Loading & preprocessing data...")
-    raw_data = load_semg_data(CONFIG['DATA_PATH'])
+
+def global_fisher(X: np.ndarray, y: np.ndarray) -> float:
+    """
+    Multivariate Fisher ratio = trace(S_B) / trace(S_W).  S_B: between-class,
+    S_W: within-class scatter.
+    """
+    mu = X.mean(axis=0)
+    SB = np.zeros((X.shape[1], X.shape[1]))
+    SW = np.zeros_like(SB)
+    for label in np.unique(y):
+        Xc = X[y == label]
+        muc = Xc.mean(axis=0)
+        SB += Xc.shape[0] * np.outer(muc - mu, muc - mu)
+        SW += (Xc - muc).T @ (Xc - muc)
+    return np.trace(SB) / np.trace(SW)
+
+
+# ───────────────────────── Data Loading ──────────────────────────
+
+def load_and_preprocess_data() -> dict:
+    """
+    Load raw HD-sEMG data, apply bandpass and notch filters per channel.
+    Returns dict of dicts: subject → gesture → filtered matrix.
+    """
+    raw = load_semg_data(CONFIG["DATA_PATH"])
     processed = {}
-    for subject, gestures in raw_data.items():
-        processed[subject] = {}
-        for gesture, data in gestures.items():
-            filtered_data = np.zeros_like(data)
-            for channel in range(data.shape[0]):
-                bp = bandpass_filter(data[channel], CONFIG['BP_CUTOFF'][0], CONFIG['BP_CUTOFF'][1], CONFIG['FS'])
-                filtered_data[channel] = notch_filter(bp, CONFIG['NOTCH_FREQ'], CONFIG['NOTCH_Q'], CONFIG['FS'])
-            processed[subject][gesture] = filtered_data
+    for subj, gests in raw.items():
+        processed[subj] = {}
+        for gest, mat in gests.items():
+            filt = np.zeros_like(mat)
+            for ch in range(mat.shape[0]):
+                bp = bandpass_filter(
+                    mat[ch], CONFIG["BP_CUTOFF"][0], CONFIG["BP_CUTOFF"][1], CONFIG["FS"]
+                )
+                filt[ch] = notch_filter(
+                    bp, CONFIG["NOTCH_FREQ"], CONFIG["NOTCH_Q"], CONFIG["FS"]
+                )
+            processed[subj][gest] = filt
     return processed
 
-# ------------------------- Dictionary Training -------------------------
-def train_dictionaries(training_data, n_atoms):
-    print(f"\n▶ Training dictionary with {n_atoms} atoms...")
-    dictionaries = {}
-    for init_method in CONFIG['DICT_INITS']:
-        print(f"Initialization: {init_method}")
-        if init_method == 'dct':
-            basis = []
-            for u in range(8):
-                for v in range(8):
-                    block = np.eye(8)[u][:, None] @ np.eye(8)[v][None, :]
-                    basis.append(idct2d(block).flatten())
-            init_dict = np.array(basis)
-            if n_atoms > 64:
-                init_dict = np.vstack([init_dict, np.random.randn(n_atoms-64, 64)])
-        else:
-            init_dict = np.random.randn(n_atoms, 64)
-        mdl = MiniBatchDictionaryLearning(
-            n_components=n_atoms,
-            dict_init=init_dict,
-            transform_algorithm='omp',
-            transform_n_nonzero_coefs=max(CONFIG['SPARSE_KS']),
-            batch_size=CONFIG['BATCH_SIZE'],
-            fit_algorithm='lars',
-            random_state=CONFIG['RNG_SEED'],
-            n_jobs=-1
-        )
-        total = len(training_data)
-        batches = int(np.ceil(total / CONFIG['BATCH_SIZE']))
-        for b in range(batches):
-            start = b * CONFIG['BATCH_SIZE']
-            end = start + CONFIG['BATCH_SIZE']
-            mdl.partial_fit(training_data[start:end])
-            if (b+1) % 10 == 0 or (b+1) == batches:
-                print(f"  Batch {b+1}/{batches} complete")
-        key = f"DL_{init_method}_{n_atoms}"
-        dictionaries[key] = mdl.components_
-    return dictionaries
 
-# ------------------------- Evaluation -------------------------
-def evaluate_methods(test_frames, dictionaries):
-    print("3/4 ▶ Evaluating reconstruction methods...")
-    methods = [f"{m}_k{k}" for m in ['DCT']+CONFIG['WAVELET_FAMILIES'] for k in CONFIG['SPARSE_KS']]
-    methods += [f"{d}_k{k}" for d in dictionaries.keys() for k in CONFIG['SPARSE_KS']]
-    results = {m: {'nmse': [], 'psnr': []} for m in methods}
-    for idx, frame in enumerate(test_frames, 1):
-        if idx % 100 == 0:
-            print(f"   ▸ Processed {idx}/{len(test_frames)} frames")
-        # Traditional methods
-        for method in ['DCT'] + CONFIG['WAVELET_FAMILIES']:
-            if method == 'DCT':
-                coeffs = dct2d(frame).flatten()
-                recon = lambda c: idct2d(c.reshape(8,8))
-            else:
-                w = pywt.Wavelet(method)
-                lvl = pywt.dwt_max_level(min(frame.shape), w.dec_len)
-                clist = pywt.wavedec2(frame, w, level=lvl)
-                carr, sl = pywt.coeffs_to_array(clist)
-                coeffs = carr.flatten()
-                recon = lambda c: pywt.waverec2(pywt.array_to_coeffs(c.reshape(carr.shape), sl, output_format='wavedec2'), w)
+# ───────────────────────── Reconstruction Methods ─────────────────
+
+def reconstruct_dct_block(block: np.ndarray, k: int) -> np.ndarray:
+    coeffs = dct2d(block).flatten()
+    idxs = np.argsort(np.abs(coeffs))[::-1][:k]
+    mask = np.zeros_like(coeffs, bool)
+    mask[idxs] = True
+    return idct2d((coeffs * mask).reshape(8, 8))
+
+
+def reconstruct_wavelet_block(
+    block: np.ndarray, family: str, k: int
+) -> np.ndarray:
+    w = pywt.Wavelet(family)
+    lvl = pywt.dwt_max_level(8, w.dec_len)
+    coeffs_list = pywt.wavedec2(block, w, level=lvl)
+    arr, slices = pywt.coeffs_to_array(coeffs_list)
+    flat = arr.flatten()
+    idxs = np.argsort(np.abs(flat))[::-1][:k]
+    mask = np.zeros_like(flat, bool)
+    mask[idxs] = True
+    filtered = (flat * mask).reshape(arr.shape)
+    return pywt.waverec2(pywt.array_to_coeffs(filtered, slices, output_format='wavedec2'), w)
+
+
+def reconstruct_dict_block(
+    block: np.ndarray, atoms: np.ndarray, k: int
+) -> np.ndarray:
+    omp = OrthogonalMatchingPursuit(n_nonzero_coefs=k)
+    omp.fit(atoms.T, block.flatten())
+    coef = omp.coef_
+    idxs = np.argsort(np.abs(coef))[::-1][:k]
+    mask = np.zeros_like(coef, bool)
+    mask[idxs] = True
+    return (atoms.T @ (coef * mask)).reshape(8, 8)
+
+
+def reconstruct_llc_block(
+    block: np.ndarray, atoms: np.ndarray, k: int, beta: float
+) -> tuple:
+    """
+    LLC reconstruction: solves weights over k nearest atoms.
+    Returns reconstructed block and full weight vector.
+    """
+    f = block.flatten()[None, :]
+    dist2 = (np.sum(f**2) - 2 * f @ atoms.T + np.sum(atoms**2, axis=1)).ravel()
+    neigh = np.argsort(dist2)[:k]
+    Z = atoms[neigh] - f  # shape (k, D)
+    C = Z @ Z.T
+    C += beta * max(np.trace(C), 1e-12) * np.eye(k)
+    w_nn, *_ = np.linalg.lstsq(C, np.ones(k), rcond=None)
+    w_nn /= w_nn.sum() + 1e-12
+    full_w = np.zeros(atoms.shape[0])
+    full_w[neigh] = w_nn
+    rec = (atoms.T @ full_w).reshape(8, 8)
+    return rec, full_w
+
+
+# ───────────────────────── Training Routines ──────────────────────
+
+def train_dictionary(
+    X_train: np.ndarray, n_atoms: int
+) -> dict:
+    """Train a MiniBatchDictionaryLearning model."""
+    mdl = MiniBatchDictionaryLearning(
+        n_components=n_atoms,
+        transform_algorithm='omp',
+        transform_n_nonzero_coefs=max(CONFIG['SPARSE_KS']),
+        batch_size=CONFIG['BATCH_SIZE'],
+        random_state=CONFIG['RNG_SEED'],
+        n_jobs=-1
+    )
+    mdl.fit(X_train)
+    return {f"DL_random_{n_atoms}": mdl.components_}
+
+
+def train_llc_vocab(
+    X_train: np.ndarray, y_train: np.ndarray
+) -> tuple:
+    """Train per-class KMeans codebooks for LLC and stack them."""
+    feats_by_cls = defaultdict(list)
+    for feat, label in zip(X_train, y_train):
+        feats_by_cls[label].append(feat)
+    feature_list = [np.vstack(v) for v in feats_by_cls.values()]
+    class_list = list(feats_by_cls.keys())
+
+    llc_model = MultiClassLLC(
+        knn=max(CONFIG['SPARSE_KS']),
+        beta=CONFIG['LLC_BETA'],
+        per_class_words=CONFIG['LLC_WORDS_PER_CLASS']
+    )
+    llc_model.fit(feature_list, class_list)
+    atoms = np.vstack([llc_model.dictionaries[cls] for cls in class_list])
+    return llc_model, atoms
+
+
+# ───────────────────────── Evaluation: Reconstruction ─────────────
+
+def evaluate_reconstruction(
+    test_frames: list, dictionaries: dict, llc_atoms: np.ndarray
+) -> dict:
+    stats = defaultdict(lambda: {'nmse': [], 'psnr': []})
+    methods = ['DCT', *CONFIG['WAVELET_FAMILIES'], *dictionaries.keys(), 'LLC']
+    for frame in test_frames:
+        for method in methods:
             for k in CONFIG['SPARSE_KS']:
-                m_key = f"{method}_k{k}"
-                idxs = np.argsort(np.abs(coeffs))[::-1][:k]
-                mask = np.zeros_like(coeffs, bool)
-                mask[idxs] = True
-                rec_img = recon(coeffs * mask)
-                results[m_key]['nmse'].append(compute_nmse(frame, rec_img))
-                results[m_key]['psnr'].append(compute_psnr(frame, rec_img))
-        # Dictionary methods
-        for dname, atoms in dictionaries.items():
-            omp = OrthogonalMatchingPursuit(n_nonzero_coefs=max(CONFIG['SPARSE_KS']))
-            omp.fit(atoms.T, frame.flatten())
-            full = omp.coef_
-            for k in CONFIG['SPARSE_KS']:
-                key = f"{dname}_k{k}"
-                idxs = np.argsort(np.abs(full))[::-1][:k]
-                sp = np.zeros_like(full)
-                sp[idxs] = full[idxs]
-                rec_img = (atoms.T @ sp).reshape(frame.shape)
-                results[key]['nmse'].append(compute_nmse(frame, rec_img))
-                results[key]['psnr'].append(compute_psnr(frame, rec_img))
-    final = {}
-    for m, v in results.items():
-        final[m] = {
+                key = f"{method}_k{k}"
+                if method == 'DCT':
+                    rec = reconstruct_dct_block(frame, k)
+                elif method in CONFIG['WAVELET_FAMILIES']:
+                    rec = reconstruct_wavelet_block(frame, method, k)
+                elif method == 'LLC':
+                    rec, _ = reconstruct_llc_block(frame, llc_atoms, k, CONFIG['LLC_BETA'])
+                else:
+                    rec = reconstruct_dict_block(frame, dictionaries[method], k)
+
+                stats[key]['nmse'].append(compute_nmse(frame, rec))
+                stats[key]['psnr'].append(compute_psnr(frame, rec))
+
+    return {
+        m: {
             'nmse_mean': np.mean(v['nmse']),
-            'nmse_std': np.std(v['nmse']),
-            'psnr_mean': np.mean(v['psnr']),
-            'psnr_std': np.std(v['psnr'])
+            'psnr_mean': np.mean(v['psnr'])
         }
-    return final
+        for m, v in stats.items()
+    }
 
-# ------------------------- Plotting -------------------------
-def plot_performance_comparison(results):
-    print("\nPerformance comparison values:")
+
+# ───────────────────────── Evaluation: Separability ──────────────
+
+def evaluate_separability(
+    data: dict, dictionaries: dict, llc_atoms: np.ndarray
+) -> dict:
+    rng = np.random.default_rng(CONFIG['RNG_SEED'])
+    gestures = list(next(iter(data.values())).keys())
+
+    frames, labels = [], []
+    for label, gesture in enumerate(gestures):
+        for subj in data.values():
+            mat = subj[gesture]
+            idxs = rng.choice(mat.shape[1], 1000, replace=False)
+            frames.append(mat[:, idxs].T)
+            labels.extend([label] * 1000)
+
+    X_orig = np.vstack(frames)
+    y = np.array(labels)
+
+    abs_sep = defaultdict(dict)
+    methods = ['Original', 'DCT', *CONFIG['WAVELET_FAMILIES'], *dictionaries.keys(), 'LLC']
+
+    total = len(methods) * len(CONFIG['SPARSE_KS'])
+    counter = 0
+    print(f"▶ Separability tasks: {total}")
+
+    for method in methods:
+        for k in CONFIG['SPARSE_KS']:
+            counter += 1
+            print(f" [{counter}/{total}] {method}, k={k}")
+
+            if method == 'Original':
+                Xr = X_orig.copy()
+            elif method == 'DCT':
+                Xr = np.array([
+                    reconstruct_dct_block(f.reshape(8, 8), k).flatten()
+                    for f in X_orig
+                ])
+            elif method in CONFIG['WAVELET_FAMILIES']:
+                Xr = np.array([
+                    reconstruct_wavelet_block(f.reshape(8, 8), method, k).flatten()
+                    for f in X_orig
+                ])
+            elif method == 'LLC':
+                Xr = np.array([
+                    reconstruct_llc_block(f.reshape(8, 8), llc_atoms, k, CONFIG['LLC_BETA'])[0].flatten()
+                    for f in X_orig
+                ])
+            else:
+                Xr = np.array([
+                    reconstruct_dict_block(f.reshape(8, 8), dictionaries[method], k).flatten()
+                    for f in X_orig
+                ])
+
+            Xs = StandardScaler().fit_transform(Xr)
+            abs_sep[method][k] = global_fisher(Xs, y)
+
+    print("Original Fisher scores:")
+    for k in CONFIG['SPARSE_KS']:
+        print(f" k={k}: {abs_sep['Original'][k]}")
+
+    rel = {
+        m: {
+            k: abs_sep[m][k] / abs_sep['Original'][k]
+            for k in CONFIG['SPARSE_KS']
+        }
+        for m in methods
+    }
+    return rel
+
+
+# ───────────────────────── Plotting Functions ─────────────────────
+
+def plot_performance_comparison(results: dict) -> None:
+    """Plot NMSE and PSNR means vs k for all methods."""
     grouping = defaultdict(list)
     for key, vals in results.items():
-        base, k_str = key.rsplit('_k', 1)
-        grouping[base].append((int(k_str), vals['nmse_mean'], vals['psnr_mean']))
+        method, k_str = key.split('_k')
+        grouping[method].append((int(k_str), vals['nmse_mean'], vals['psnr_mean']))
 
-    for base, lst in grouping.items():
-        lst = sorted(lst, key=lambda x: x[0])
-        ks  = [x[0] for x in lst]
-        nm  = [round(x[1],4) for x in lst]
-        ps  = [round(x[2],2) for x in lst]
-        print(f"{base}: ks={ks}\n  NMSE means={nm}\n  PSNR means={ps}")
+    print("Performance (NMSE / PSNR means):")
+    for method, lst in grouping.items():
+        lst = sorted(lst)
+        ks = [x[0] for x in lst]
+        nm = [x[1] for x in lst]
+        ps = [x[2] for x in lst]
+        print(f"{method}: ks={ks} NMSE={nm} PSNR={ps}")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=CONFIG['PLOT_SIZE'])
-    styles = {
-        'DCT': '--', 'db1': '-.', 'coif1': ':', 'bior1.3': (0,(3,1,1,1)),
-        **{f"DL_random_{n}": '-' for n in CONFIG['DICT_ATOMS_LIST']}
-    }
-    markers = ['o','s','D','^','v']
-    colors  = ['#1f77b4','#2ca02c','#d62728','#9467bd','#8c564b']
+    styles = {'DCT': '--', 'bior1.3': '-.', 'db1': ':', 'coif1': (0, (3, 1, 1, 1))}
+    styles.update({f'DL_random_{n}': '-' for n in CONFIG['DICT_ATOMS_LIST']})
+    styles['LLC'] = '--'
+    markers = ['o', 's', 'D', '^', 'v', '>', '<', 'p']
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
-    for idx, (mth, style) in enumerate(styles.items()):
-        if mth not in grouping:
-            continue
-        lst = sorted(grouping[mth], key=lambda x: x[0])
-        ks  = [x[0] for x in lst]
-        nm  = [x[1] for x in lst]
-        ps  = [x[2] for x in lst]
-        ax1.plot(ks, nm, label=mth, linestyle=style, marker=markers[idx%len(markers)], color=colors[idx%len(colors)])
-        ax2.plot(ks, ps, label=mth, linestyle=style, marker=markers[idx%len(markers)], color=colors[idx%len(colors)])
+    for i, (method, lst) in enumerate(grouping.items()):
+        lst = sorted(lst)
+        ks = [x[0] for x in lst]
+        nm = [x[1] for x in lst]
+        ps = [x[2] for x in lst]
+        ax1.plot(
+            ks, nm,
+            label=method,
+            linestyle=styles.get(method, '-'),
+            marker=markers[i % len(markers)],
+            color=colors[i % len(colors)]
+        )
+        ax2.plot(
+            ks, ps,
+            label=method,
+            linestyle=styles.get(method, '-'),
+            marker=markers[i % len(markers)],
+            color=colors[i % len(colors)]
+        )
 
-    ax1.set(xlabel='Sparsity Level (k)', ylabel='NMSE')
+    ax1.set(xlabel='Sparsity k', ylabel='NMSE')
     ax1.grid(alpha=0.3)
     ax1.legend(loc='best')
 
-    ax2.set(xlabel='Sparsity Level (k)', ylabel='PSNR (dB)')
+    ax2.set(xlabel='Sparsity k', ylabel='PSNR (dB)')
     ax2.grid(alpha=0.3)
     ax2.legend(loc='best')
 
@@ -215,69 +394,84 @@ def plot_performance_comparison(results):
     plt.show()
 
 
+def plot_separability(sep: dict, normalize: bool = True) -> None:
+    """Plot relative or absolute Fisher separability vs k."""
+    ref = sep['Original']
+    fig, ax = plt.subplots(figsize=CONFIG['PLOT_SIZE'])
+    for method, scores in sep.items():
+        ks = sorted(scores)
+        vals = [scores[k] / ref[k] if normalize else scores[k] for k in ks]
+        ax.plot(ks, vals, marker='o', label=method)
 
-def plot_all_reconstructions(test_frame, dictionaries):
-    methods = ['DCT'] + CONFIG['WAVELET_FAMILIES'] + list(dictionaries.keys())
-    n_rows = len(methods) + 1
-    n_cols = len(CONFIG['SPARSE_KS']) + 1
-    fig = plt.figure(figsize=(2*n_cols, 2*n_rows))
+    ylabel = 'Relative Fisher (Original=1)' if normalize else 'Fisher Global'
+    ax.set(xlabel='Sparsity k', ylabel=ylabel)
+    ax.grid(alpha=0.3)
+    ax.legend()
+
+    plt.tight_layout()
+    fn = 'sep_rel.png' if normalize else 'sep_abs.png'
+    plt.savefig(os.path.join(OUTPUT_DIR, fn), bbox_inches='tight')
+    plt.show()
+
+
+def plot_all_reconstructions(
+    test_frame: np.ndarray,
+    dictionaries: dict,
+    llc_atoms: np.ndarray
+) -> None:
+    """Display a grid of original + reconstructions for each method and k."""
+    methods = ['Original', 'DCT'] + CONFIG['WAVELET_FAMILIES'] + list(dictionaries.keys()) + ['LLC']
+    n_rows = len(methods)
+    n_cols = len(CONFIG['SPARSE_KS'])
+    fig, axes = plt.subplots(
+        n_rows, n_cols + 1,
+        figsize=(2 * (n_cols + 1), 2 * n_rows)
+    )
     plt.suptitle("Reconstruction Comparison Across Methods and Sparsity Levels", y=1.02)
 
-    # Original
-    ax = fig.add_subplot(n_rows, n_cols, 1)
-    ax.imshow(test_frame, cmap='viridis')
-    ax.set_title("Original")
-    ax.axis('off')
-
-    # Column headers
-    for i, k in enumerate(CONFIG['SPARSE_KS'], start=1):
-        ax = fig.add_subplot(n_rows, n_cols, i+1)
-        ax.set_title(f"k={k}", fontsize=8)
+    # Labels and original
+    for i, method in enumerate(methods):
+        ax = axes[i, 0]
+        if method == 'Original':
+            ax.imshow(test_frame, cmap='viridis')
+            ax.set_title('Original')
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, method, ha='center', va='center', fontsize=8)
         ax.axis('off')
 
-    # Rows
-    for r, method in enumerate(methods, start=1):
-        # Method label
-        ax = fig.add_subplot(n_rows, n_cols, r*n_cols + 1)
-        ax.text(0.5, 0.5, method.replace('_', '\n'), ha='center', va='center', fontsize=8)
-        ax.axis('off')
-        for c, k in enumerate(CONFIG['SPARSE_KS'], start=1):
-            ax = fig.add_subplot(n_rows, n_cols, r*n_cols + c + 1)
-            # Compute coefficients
-            if method == 'DCT':
-                coeffs = dct2d(test_frame).flatten()
-                recon_fn = lambda v: idct2d(v.reshape(8,8))
+    # Column titles k
+    for j, k in enumerate(CONFIG['SPARSE_KS'], start=1):
+        axes[0, j].set_title(f'k={k}', fontsize=8)
+
+    # Reconstruction panels
+    for i, method in enumerate(methods):
+        for j, k in enumerate(CONFIG['SPARSE_KS'], start=1):
+            ax = axes[i, j]
+            if method == 'Original':
+                rec = test_frame
+            elif method == 'DCT':
+                rec = reconstruct_dct_block(test_frame, k)
             elif method in CONFIG['WAVELET_FAMILIES']:
-                w = pywt.Wavelet(method)
-                lvl = pywt.dwt_max_level(min(test_frame.shape), w.dec_len)
-                clist = pywt.wavedec2(test_frame, w, level=lvl)
-                carr, sl = pywt.coeffs_to_array(clist)
-                coeffs = carr.flatten()
-                recon_fn = lambda v: pywt.waverec2(
-                    pywt.array_to_coeffs(v.reshape(carr.shape), sl, output_format='wavedec2'), w)
+                rec = reconstruct_wavelet_block(test_frame, method, k)
+            elif method == 'LLC':
+                rec, _ = reconstruct_llc_block(test_frame, llc_atoms, k, CONFIG['LLC_BETA'])
             else:
-                atoms = dictionaries[method]
-                omp  = OrthogonalMatchingPursuit(n_nonzero_coefs=k)
-                omp.fit(atoms.T, test_frame.flatten())
-                coeffs = omp.coef_
-                # CORRECT: reshape the flattened image back to 8×8
-                recon_fn = lambda v, atoms=atoms: (atoms.T @ v).reshape(8, 8)
-                
-            # Threshold
-            idxs = np.argsort(np.abs(coeffs))[::-1][:k]
-            mask = np.zeros_like(coeffs, bool)
-            mask[idxs] = True
-            rec = recon_fn(coeffs * mask)
+                rec = reconstruct_dict_block(test_frame, dictionaries[method], k)
 
             ax.imshow(rec, cmap='viridis')
             ax.axis('off')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'full_reconstruction_comparison.png'), bbox_inches='tight')
+    plt.savefig(
+        os.path.join(OUTPUT_DIR, 'full_reconstruction_comparison.png'),
+        bbox_inches='tight'
+    )
     plt.show()
 
-# ------------------------- Main -------------------------
-if __name__ == "__main__":
+
+# ───────────────────────── Main Pipeline ──────────────────────────
+if __name__ == '__main__':
     # Load or preprocess data
     if os.path.exists(CONFIG['PICKLE_PATH']):
         with open(CONFIG['PICKLE_PATH'], 'rb') as f:
@@ -287,26 +481,36 @@ if __name__ == "__main__":
         with open(CONFIG['PICKLE_PATH'], 'wb') as f:
             pickle.dump(data, f)
 
-    # Prepare vectors
+    # Prepare samples for train/test split
+    samples = []
+    for gesture in next(iter(data.values())).keys():
+        for subj in data.values():
+            mats = subj[gesture]
+            for vec in mats.T:
+                samples.append((vec, gesture))
+
     rng = np.random.default_rng(CONFIG['RNG_SEED'])
-    all_vecs = []
-    for sub in data.values():
-        for mat in sub.values():
-            all_vecs.extend(mat.T)
-    idxs = rng.permutation(len(all_vecs))
-    n_train = int(CONFIG['TRAIN_FRAC'] * len(all_vecs))
+    perm = rng.permutation(len(samples))
+    n_train = int(CONFIG['TRAIN_FRAC'] * len(samples))
+    train_idx, test_idx = perm[:n_train], perm[n_train:n_train + CONFIG['TEST_SAMPLES']]
 
-    X_train = np.vstack([vector_to_image(all_vecs[i]).flatten() for i in idxs[:n_train]])
-    test_frames = [vector_to_image(all_vecs[i]) for i in idxs[n_train:n_train+CONFIG['TEST_SAMPLES']]]
+    X_train = np.vstack([vector_to_image(samples[i][0]).flatten() for i in train_idx])
+    y_train = np.array([samples[i][1] for i in train_idx])
+    test_frames = [vector_to_image(samples[i][0]) for i in test_idx]
 
-    # Train dictionaries
-    dicts = {}
-    for na in CONFIG['DICT_ATOMS_LIST']:
-        dicts.update(train_dictionaries(X_train, na))
+    # Train dictionaries and LLC vocab
+    dicts = train_dictionary(X_train, CONFIG['DICT_ATOMS_LIST'][0])
+    llc_model, llc_atoms = train_llc_vocab(X_train, y_train)
 
-    # Evaluate
-    results = evaluate_methods(test_frames, dicts)
-    plot_performance_comparison(results)
-    plot_all_reconstructions(test_frames[0], dicts)
+    # Evaluate reconstruction quality
+    rec_results = evaluate_reconstruction(test_frames, dicts, llc_atoms)
+    plot_performance_comparison(rec_results)
 
+    # Evaluate and plot separability
+    sep_results = evaluate_separability(data, dicts, llc_atoms)
+    plot_separability(sep_results, normalize=False)
 
+    # Plot full reconstructions for one test frame
+    plot_all_reconstructions(test_frames[0], dicts, llc_atoms)
+
+    print("Done.")
