@@ -125,9 +125,11 @@ for subj, gests in windows_1s.items():
                 img = vec.reshape(8, 8)
                 coeffs = pywt.wavedec2(img, wavelet, level=lvl)
                 arr, slices = pywt.coeffs_to_array(coeffs)
-                idxs = np.argsort(np.abs(arr.ravel()))[-SPARSITY:]
-                arr[np.unravel_index(idxs, arr.shape)] = 0
-                rec_dwt = pywt.waverec2(pywt.array_to_coeffs(arr, slices, 'wavedec2'), wavelet)
+                idxs = np.argsort(np.abs(arr.ravel()))[::-1][:SPARSITY]
+                mask = np.zeros(arr.size, bool)
+                mask[idxs] = True
+                arr_filtered = (arr.ravel() * mask).reshape(arr.shape)
+                rec_dwt = pywt.waverec2(pywt.array_to_coeffs(arr_filtered, slices, 'wavedec2'), wavelet)
                 R_dwt[:,t] = rec_dwt.ravel()
                 
                 # Dictionary Reconstruction
