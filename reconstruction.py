@@ -48,7 +48,7 @@ CONFIG = {
     "NOTCH_Q": 50,
     "TRAIN_FRAC": 0.02,
     "TEST_SAMPLES": 2500,
-    "RNG_SEED": 191,
+    "RNG_SEED": 19,
     "SPARSE_KS": [8,10,12,14,16,18,20,22,24],
     "WAVELET_FAMILIES": ["bior1.3", "db1", "coif1"],
     "DICT_ATOMS_LIST": [128],
@@ -321,7 +321,7 @@ def evaluate_separability(
                 ])
 
             Xs = StandardScaler().fit_transform(Xr)
-            abs_sep[method][k] = global_fisher(Xs, y)
+            abs_sep[method][k] = global_fisher(abs(Xs), y)
 
     print("Original Fisher scores:")
     for k in CONFIG['SPARSE_KS']:
@@ -340,7 +340,11 @@ def evaluate_separability(
 # ───────────────────────── Plotting Functions ─────────────────────
 
 def plot_performance_comparison(results: dict) -> None:
-    """Plot NMSE and PSNR means vs k for all methods."""
+    """Plot NMSE and PSNR means vs k for all methods, with discrete k, larger text, and legend at bottom."""
+    from collections import defaultdict
+    import matplotlib.pyplot as plt
+    import os
+
     grouping = defaultdict(list)
     for key, vals in results.items():
         method, k_str = key.split('_k')
@@ -354,63 +358,106 @@ def plot_performance_comparison(results: dict) -> None:
         ps = [x[2] for x in lst]
         print(f"{method}: ks={ks} NMSE={nm} PSNR={ps}")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=CONFIG['PLOT_SIZE'])
+    # Use a slightly taller figure to better fit big fonts and the legend
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8) if CONFIG['PLOT_SIZE'][1] < 7 else CONFIG['PLOT_SIZE'])
+
     styles = {'DCT': '--', 'bior1.3': '-.', 'db1': ':', 'coif1': (0, (3, 1, 1, 1))}
     styles.update({f'DL_random_{n}': '-' for n in CONFIG['DICT_ATOMS_LIST']})
     styles['LLC'] = '--'
     markers = ['o', 's', 'D', '^', 'v', '>', '<', 'p']
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
+    legend_handles = []
+    legend_labels = []
+
     for i, (method, lst) in enumerate(grouping.items()):
         lst = sorted(lst)
         ks = [x[0] for x in lst]
         nm = [x[1] for x in lst]
         ps = [x[2] for x in lst]
-        ax1.plot(
+
+        handle1, = ax1.plot(
             ks, nm,
             label=method,
             linestyle=styles.get(method, '-'),
             marker=markers[i % len(markers)],
-            color=colors[i % len(colors)]
+            color=colors[i % len(colors)],
+            markersize=7.5
         )
         ax2.plot(
             ks, ps,
             label=method,
             linestyle=styles.get(method, '-'),
             marker=markers[i % len(markers)],
-            color=colors[i % len(colors)]
+            color=colors[i % len(colors)],
+            markersize=7.5
         )
+        legend_handles.append(handle1)
+        legend_labels.append(method)
 
     ax1.set(xlabel='Sparsity k', ylabel='NMSE')
-    ax1.grid(alpha=0.3)
-    ax1.legend(loc='best')
-
     ax2.set(xlabel='Sparsity k', ylabel='PSNR (dB)')
-    ax2.grid(alpha=0.3)
-    ax2.legend(loc='best')
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'linear_performance_comparison.png'), bbox_inches='tight')
+    for ax in (ax1, ax2):
+        ax.tick_params(axis='both', which='major', labelsize=22)
+        ax.xaxis.label.set_size(22)
+        ax.yaxis.label.set_size(22)
+        ax.grid(alpha=0.3)
+        ks_all = sorted(set(k for lst in grouping.values() for k, _, _ in lst))
+        ax.set_xticks(ks_all)
+
+    # Adjust layout to reserve extra space at bottom for large legend
+    plt.subplots_adjust(bottom=0.32)
+    fig.legend(
+        legend_handles, legend_labels,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=min(len(legend_labels), 5), fontsize=20, frameon=False
+    )
+
+    plt.tight_layout(rect=[0, 0.18, 1, 1])  # more room for legend
+    plt.savefig(os.path.join(OUTPUT_DIR, 'linear_performance_comparison.png'))
     plt.show()
 
 
 def plot_separability(sep: dict, normalize: bool = True) -> None:
-    """Plot relative or absolute Fisher separability vs k."""
+    """Plot Fisher separability vs k, with discrete k, larger text, and legend at bottom."""
+    import matplotlib.pyplot as plt
+    import os
+
     ref = sep['Original']
-    fig, ax = plt.subplots(figsize=CONFIG['PLOT_SIZE'])
-    for method, scores in sep.items():
+    fig, ax = plt.subplots(figsize=(14, 8) if CONFIG['PLOT_SIZE'][1] < 7 else CONFIG['PLOT_SIZE'])
+
+    legend_handles = []
+    legend_labels = []
+
+    for i, (method, scores) in enumerate(sep.items()):
         ks = sorted(scores)
         vals = [scores[k] / ref[k] if normalize else scores[k] for k in ks]
-        ax.plot(ks, vals, marker='o', label=method)
+        handle, = ax.plot(ks, vals, marker='o', label=method, markersize=7.5)
+        legend_handles.append(handle)
+        legend_labels.append(method)
 
     ylabel = 'Relative Fisher (Original=1)' if normalize else 'Fisher Global'
     ax.set(xlabel='Sparsity k', ylabel=ylabel)
+    ax.tick_params(axis='both', which='major', labelsize=22)
+    ax.xaxis.label.set_size(22)
+    ax.yaxis.label.set_size(22)
     ax.grid(alpha=0.3)
-    ax.legend()
+    ks_all = sorted(set(k for scores in sep.values() for k in scores))
+    ax.set_xticks(ks_all)
 
-    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.28)
+    fig.legend(
+        legend_handles, legend_labels,
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.03),
+        ncol=min(len(legend_labels), 5), fontsize=20, frameon=False
+    )
+
+    plt.tight_layout(rect=[0, 0.16, 1, 1])
     fn = 'sep_rel.png' if normalize else 'sep_abs.png'
-    plt.savefig(os.path.join(OUTPUT_DIR, fn), bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, fn))
     plt.show()
 
 

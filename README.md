@@ -2,6 +2,9 @@
 
 python version 3.9.12
 
+pre: download data from https://data.4tu.nl/articles/Raw_data_collected_for_the_study_of_Characterization_of_forearm_high-density_electromyograms_during_wrist-hand_tasks_in_individuals_with_Duchenne_Muscular_Dystrophy/12718697
+place Data_KN at root folder.
+
 1) remove HS8 from dataset and run data_preprocess.py. 
 
 It cleans and normalizes the raw signals by fixing bad channels, applying band-pass (20–450 Hz) and notch (50 Hz) filters, and scaling most values to within ±20. The cleaned signals are saved as data_for_training/processed_data.pkl.
